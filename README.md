@@ -25,7 +25,6 @@ Mamba utilizes Selective State Spaces to achieve **O(N)** linear scaling, allowi
 The system is currently deployed as a Sentinel on a low-latency CPU instance.
 
 [2026-01-26 08:31:19 UTC] Signal: -0.0089 | ⚪ WAITING
-[2026-01-26 09:31:19 UTC] Signal: -0.0251 | ⚪ WAITING
 
 
 ---
