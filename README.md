@@ -27,11 +27,6 @@ The system is currently deployed as a Sentinel on a low-latency CPU instance.
 [2026-01-26 08:31:19 UTC] Signal: -0.0089 | ⚪ WAITING
 [2026-01-26 09:31:19 UTC] Signal: -0.0251 | ⚪ WAITING
 
-## 🟢 Live Inference Demo
-The system is capable of real-time market analysis. Below is a screenshot of the model running locally on a CPU, detecting a bearish regime (-0.34 signal) and triggering a "STRONG SELL" alert.
-
-![Live Inference](assets/live_inference_screenshot.png)
-
 
 ---
 
