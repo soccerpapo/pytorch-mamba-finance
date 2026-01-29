@@ -2,55 +2,40 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import yfinance as yf
 from sklearn.preprocessing import StandardScaler
 import random
 import copy
 import sys
 import os
 
-# Import Architecture
-# Assumes model.py is in the same folder
+# --- 1. PATH SETUP ---
+# Dynamically calculate the path to 'src' so this script runs from anywhere
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(current_dir, "../../../"))
+sys.path.append(root_dir)
+
 try:
-    from model import DifferentiableTrader
-except ImportError:
-    print("❌ Error: 'model.py' not found. Please ensure it is in the same folder.")
-    sys.exit()
+    from src.model import DifferentiableTrader
+    from src.data import get_market_data
+except ImportError as e:
+    print(f"Import Error: {e}")
+    sys.exit(1)
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS_PER_RUN = 10   # Fast training per candidate
-ITERATIONS = 50       # Total candidates to try (Reduced for demo purposes)
+EPOCHS_PER_RUN = 10   
+ITERATIONS = 50       
 SYMBOL = 'BTC-USD'
-
-def get_real_data(symbol=SYMBOL, period='2y'):
-    print(f"📥 Downloading {period} of {symbol}...")
-    try:
-        data = yf.download(symbol, period=period, interval='1h', progress=False)
-        if len(data) == 0: raise ValueError("No data found")
-    except Exception as e:
-        print(f"❌ Data Error: {e}")
-        sys.exit()
-
-    prices = data['Close'].values.squeeze()
-    volumes = data['Volume'].values.squeeze()
-    
-    # Log Returns & Volume Changes
-    log_returns = np.diff(np.log(prices))
-    log_volume_change = np.diff(np.log(volumes + 1e-8))
-    
-    features = np.column_stack((log_returns, log_volume_change))
-    return features
+# NEW: Force the save path to be inside this specific folder
+SAVE_PATH = os.path.join(current_dir, "champion_model.pth")
 
 def make_batches(data, b_size):
     x_batches = []
-    # Create sliding windows of 50
     for i in range(len(data) - 50):
         window = data[i:i+50]
         if len(window) == 50:
             x_batches.append(torch.tensor(window, dtype=torch.float32))
     
-    # Batch them
     loader = []
     for i in range(0, len(x_batches), b_size):
         batch = x_batches[i:i+b_size]
@@ -59,12 +44,12 @@ def make_batches(data, b_size):
     return loader
 
 def train_one_candidate(features, run_id):
-    # 1. Randomize Hyperparameters (The "Mutation")
+    # Mutation
     learning_rate = random.choice([0.005, 0.001, 0.0005, 0.0001])
     batch_size = random.choice([32, 64, 128])
     d_model = random.choice([16, 32, 64]) 
     
-    # 2. Train/Val Split (80/20)
+    # Train/Val Split
     split_idx = int(len(features) * 0.8)
     train_data = features[:split_idx]
     val_data = features[split_idx:]
@@ -76,20 +61,18 @@ def train_one_candidate(features, run_id):
     train_loader = make_batches(train_norm, batch_size)
     val_loader = make_batches(val_norm, batch_size)
 
-    # 3. Initialize Model
+    # Init Model
     model = DifferentiableTrader(input_dim=2, d_model=d_model).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
     
-    # 4. Train Loop
+    # Train Loop
     for epoch in range(EPOCHS_PER_RUN):
         model.train()
         for batch in train_loader:
             optimizer.zero_grad()
             positions = model(batch)
             
-            # --- THE "FEE-BLIND" OBJECTIVE ---
-            # Maximizes raw return without accounting for transaction costs.
-            # This is the root cause of the strategy's failure.
+            # Fee-Blind Loss (The Trap)
             returns = batch[:, :, 0:1] 
             strategy_returns = positions * returns
             loss = -torch.mean(strategy_returns) 
@@ -97,7 +80,7 @@ def train_one_candidate(features, run_id):
             loss.backward()
             optimizer.step()
             
-    # 5. Validation
+    # Validation
     model.eval()
     val_score = 0
     with torch.no_grad():
@@ -110,32 +93,44 @@ def train_one_candidate(features, run_id):
     return model, val_score, d_model
 
 def main():
-    print(f"🔥 STARTING FLEET TRAINING ON {DEVICE}")
+    print(f"STARTING FLEET TRAINING ON {DEVICE}")
     print("   (Experiment: Fee-Blind Optimization)")
+    print(f"   (Saving to: {SAVE_PATH})")
     
-    data = get_real_data()
+    try:
+        data = get_market_data(SYMBOL, period='2y')
+    except Exception as e:
+        print(f"Data Error: {e}")
+        return
         
     best_score = -999999
-    best_model = None
     best_config = {}
 
     for i in range(ITERATIONS):
         candidate, score, size = train_one_candidate(data, i+1)
         
         if score > best_score:
-            print(f"🌟 NEW CHAMPION FOUND! (Score: {score:.4f})")
+            print(f"NEW CHAMPION FOUND! (Score: {score:.4f})")
             best_score = score
-            best_model = copy.deepcopy(candidate)
             best_config = {'d_model': size}
-            torch.save(best_model.state_dict(), "champion_model.pth")
+            
+            checkpoint = {
+                'model_state_dict': candidate.state_dict(),
+                'config': {
+                    'd_model': size,
+                    'input_dim': 2,
+                    'strategy': 'fee_blind'
+                },
+                'score': best_score
+            }
+            # UPDATED: Uses the absolute path we defined at the top
+            torch.save(checkpoint, SAVE_PATH)
                 
     print("\n" + "="*40)
-    print(f"🏆 SEARCH COMPLETE.")
+    print(f"SEARCH COMPLETE.")
     print(f"   - Best Validation Score: {best_score:.4f}")
-    print(f"   - Best Model Size: {best_config.get('d_model')}")
-    print(f"   - Saved to: champion_model.pth")
+    print(f"   - Saved to: {SAVE_PATH}")
     print("="*40)
 
 if __name__ == "__main__":
     main()
-    

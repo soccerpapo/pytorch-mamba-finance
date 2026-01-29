@@ -70,13 +70,17 @@ class DifferentiableTrader(nn.Module):
     """
     def __init__(self, input_dim, d_model):
         super().__init__()
+        # Note: We pass input_dim to physics to maintain compatibility with your 
+        # existing trained weights (champion_model.pth).
         self.physics = FinancialMambaBlock(d_model=input_dim, d_state=16)
+        
         self.head = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
             nn.Tanh()
         )
+        
     def forward(self, x):
         context = self.physics(x)
         return self.head(context)

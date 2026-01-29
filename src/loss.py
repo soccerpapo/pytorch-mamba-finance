@@ -14,12 +14,14 @@ def differentiable_sharpe_loss(positions, returns, transaction_cost=0.0005):
         torch.Tensor: Scalar loss value (lower is better).
     """
     # 1. Calculate Strategy Returns
+    # positions shape: [Batch, Seq, 1], returns shape: [Batch, Seq, 1]
     strategy_returns = positions * returns
     
     # 2. Calculate Transaction Costs
     # We use the change in position (delta) to estimate trade volume
     trades = torch.abs(positions[:, 1:] - positions[:, :-1])
-    # Pad the first time step because there is no "previous" position
+    
+    # Pad the first time step with 0 (no trade cost for entering the very first bar)
     trades = F.pad(trades, (0, 0, 1, 0))
     
     costs = trades * transaction_cost
