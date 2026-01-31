@@ -1,78 +1,78 @@
 import torch
 import numpy as np
 import yfinance as yf
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
 
-def get_market_data(symbol='BTC-USD', period='2y', interval='1h'):
-    """
-    Fetches raw data from YFinance and computes features (Log Returns, Log Vol).
-    """
-    print(f"📥 Downloading {symbol} ({period})...")
+#relative strength index not normalized: detects overbought/oversold
+def calculate_rsi_notnorm(series, period = 14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window = period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window = period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+#moving average convergence divergence and signal line: detects momentum shifts
+def calculate_macd_signalline(series, fast = 12, slow = 26, signal = 9):
+    exp1 = series.ewm(span = fast, adjust = False).mean()
+    exp2 = series.ewm(span = slow, adjust = False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span = signal, adjust = False).mean()
+    return macd, signal_line
+
+#bollinger bands position: detects volatility breakouts
+def calculate_bollinger_position(series, window = 20):
+    sma = series.rolling(window = window).mean()
+    std = series.rolling(window = window).std()
+    upper = sma + (std * 2)
+    lower = sma - (std * 2)
+    #normalization: scaling data (price position) into [0,1]. contrary to standardization, where data is scaled into (-3,3)
+    #>1 means breakout up, <0 means breakout down
+    bb_pos = (series - lower) / (upper - lower)
+    return bb_pos
+
+#design matrix made out of Log returns (better than raw price), Relative strength index normalized (momentum), Moving average convergence divergence difference (trend), Bollinger bands position (volatility breakout), Rolling volatility (risk context), and Volume change (activity)
+def get_market_data(symbol, period = '2y', interval = '1h'):
+    print(f"downloading {symbol}...")
+
     try:
-        data = yf.download(symbol, period=period, interval=interval, progress=False)
-        if len(data) == 0:
-            raise ValueError(f"No data found for {symbol}")
+        df = yf.download(symbol, period = period, interval = interval, progress = False, auto_adjust = True)
     except Exception as e:
-        raise ValueError(f"YFinance Download Error: {e}")
+        raise ValueError(f"YFinance download error: {e}")
+    
+    #if it doesnt have rows
+    if len(df) == 0:
+        raise ValueError("no data downloaded. check symbol or internet connection")
+    
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    
+    close = df['Close']
 
-    # .squeeze() handles cases where yfinance returns extra dimensions
-    prices = data['Close'].values.squeeze()
-    volumes = data['Volume'].values.squeeze()
-    
-    # Feature Engineering
-    # Log returns are preferred in finance over raw % change because they are additive
-    log_returns = np.diff(np.log(prices))
-    
-    # Add 1e-8 to volume to prevent log(0) errors if volume is zero
-    log_volume_change = np.diff(np.log(volumes + 1e-8))
-    
-    # Stack features: [Rows, 2]
-    features = np.column_stack((log_returns, log_volume_change))
-    return features
+    df["log_returns"] = np.log(close / close.shift(1))
 
-def generate_synthetic_data(n_samples=5000):
-    """
-    Generates mock data for unit testing model stability.
-    """
-    print(f"🧪 Generating {n_samples} hours of synthetic data...")
-    returns = np.random.normal(0, 0.01, n_samples)
-    volume_noise = np.random.normal(0, 0.05, n_samples)
-    
-    # Correlate volume slightly with volatility (common in real markets)
-    volume_changes = np.abs(returns) * 5 + volume_noise 
-    
-    features = np.column_stack((returns, volume_changes))
-    return features
+    #Relative strength index normalized here
+    df["rsi_norm"] = calculate_rsi_notnorm(close) / 100.0
 
-def create_dataloaders(features, seq_len=50, batch_size=64, device='cpu'):
-    """
-    Converts a long time-series array into sliding window batches for training.
-    """
-    # 1. Normalize
-    # We fit the scaler on the entire history provided here.
-    # In strict backtesting, you should fit only on 'train' split, 
-    # but for this architecture, we usually pass the pre-split data.
-    scaler = StandardScaler()
-    features_norm = scaler.fit_transform(features)
+    #histogram value
+    macd, signal_line = calculate_macd_signalline(close)
+    df["macd_diff"] = macd - signal_line
+
+    df["bollinger_position"] = calculate_bollinger_position(close)
+
+    #volatility: how risky the market is right now
+    df["volatility_20"] = df['log_returns'].rolling(window = 20).std()
+
+    vol = df['Volume'].replace(0, np.nan).ffill()
     
-    # 2. Create Windows
-    windows = []
-    # Create valid sequences of length seq_len
-    for i in range(len(features_norm) - seq_len):
-        windows.append(features_norm[i : i + seq_len])
-    
-    # 3. Batching
-    # Note: np.array(windows) can be memory intensive for massive datasets.
-    # For 2 years of hourly data (~17k rows), it is perfectly fine (~10MB).
-    windows = np.array(windows)
-    x_batches = []
-    
-    # Convert to Tensor Batches and move to DEVICE
-    # We move to device here for speed, assuming GPU VRAM fits the dataset.
-    for i in range(0, len(windows), batch_size):
-        batch_data = windows[i : i + batch_size]
-        if len(batch_data) > 0:
-            x_tensor = torch.tensor(batch_data, dtype=torch.float32).to(device)
-            x_batches.append(x_tensor)
-            
-    return x_batches, scaler
+    #volume change: activity
+    df["volume_change"] = np.log(vol / vol.shift(1)).fillna(0)
+
+    df["volume_change"] = df['volume_change'].replace([np.inf, -np.inf], 0)
+
+    df.dropna(inplace = True)
+
+    design_columns = ['log_returns', 'rsi_norm', 'macd_diff', 'bollinger_position', 'volatility_20', 'volume_change']
+
+    print(f"data engineered. matrix shape: {df[design_columns].shape}")
+    print(f"columns: {design_columns}")
+
+    return df[design_columns].values
