@@ -3,76 +3,78 @@ import numpy as np
 import yfinance as yf
 import pandas as pd
 
-#relative strength index not normalized: detects overbought/oversold
-def calculate_rsi_notnorm(series, period = 14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window = period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window = period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+class KalmanFilter1D:
+    def __init__(self, dt=1.0, u=0.0, std_acc=0.1, std_meas=0.1):
+        self.dt = dt
+        self.u = u
+        self.std_acc = std_acc
+        self.std_meas = std_meas
+        self.A = np.matrix([[1, self.dt], [0, 1]])
+        self.B = np.matrix([[0], [0]])
+        self.H = np.matrix([[1, 0]])
+        self.Q = np.matrix([[(self.dt**4)/4, (self.dt**3)/2],
+                            [(self.dt**3)/2, self.dt**2]]) * self.std_acc**2
+        self.R = np.matrix([[self.std_meas**2]])
+        self.P = np.eye(self.A.shape[1])
 
-#moving average convergence divergence and signal line: detects momentum shifts
-def calculate_macd_signalline(series, fast = 12, slow = 26, signal = 9):
-    exp1 = series.ewm(span = fast, adjust = False).mean()
-    exp2 = series.ewm(span = slow, adjust = False).mean()
-    macd = exp1 - exp2
-    signal_line = macd.ewm(span = signal, adjust = False).mean()
-    return macd, signal_line
+    def predict(self, x):
+        x = np.dot(self.A, x) + np.dot(self.B, self.u)
+        self.P = np.dot(np.dot(self.A, self.P), self.A.T) + self.Q
+        return x
 
-#bollinger bands position: detects volatility breakouts
-def calculate_bollinger_position(series, window = 20):
-    sma = series.rolling(window = window).mean()
-    std = series.rolling(window = window).std()
-    upper = sma + (std * 2)
-    lower = sma - (std * 2)
-    #normalization: scaling data (price position) into [0,1]. contrary to standardization, where data is scaled into (-3,3)
-    #>1 means breakout up, <0 means breakout down
-    bb_pos = (series - lower) / (upper - lower)
-    return bb_pos
+    def update(self, x, z):
+        y = z - np.dot(self.H, x)
+        S = np.dot(self.H, np.dot(self.P, self.H.T)) + self.R
+        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+        x = x + np.dot(K, y)
+        I = np.eye(self.H.shape[1])
+        self.P = np.dot((I - np.dot(K, self.H)), self.P)
+        return x, y, S
 
-#design matrix made out of Log returns (better than raw price), Relative strength index normalized (momentum), Moving average convergence divergence difference (trend), Bollinger bands position (volatility breakout), Rolling volatility (risk context), and Volume change (activity)
-def get_market_data(symbol, period = '2y', interval = '1h'):
-    print(f"downloading {symbol}...")
-
+def get_market_data(symbol, period='2y', interval='1h'):
+    print(f"📥 [Berkeley] Downloading {symbol}...")
     try:
-        df = yf.download(symbol, period = period, interval = interval, progress = False, auto_adjust = True)
+        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
     except Exception as e:
         raise ValueError(f"YFinance download error: {e}")
-    
-    #if it doesnt have rows
-    if len(df) == 0:
-        raise ValueError("no data downloaded. check symbol or internet connection")
-    
+
+    if len(df) == 0: raise ValueError("No data downloaded.")
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    
-    close = df['Close']
 
-    df["log_returns"] = np.log(close / close.shift(1))
+    close = df['Close'].values
+    log_ret = np.log(df['Close'] / df['Close'].shift(1)).fillna(0).values
 
-    #Relative strength index normalized here
-    df["rsi_norm"] = calculate_rsi_notnorm(close) / 100.0
+    # 🏆 WINNER: std_meas=0.2, std_acc=1e-05
+    # This sedates the filter so it only tracks real trends
+    kf = KalmanFilter1D(dt=1.0, std_acc=0.00001, std_meas=0.2)
 
-    #histogram value
-    macd, signal_line = calculate_macd_signalline(close)
-    df["macd_diff"] = macd - signal_line
+    x = np.matrix([[close[0]], [0]])
 
-    df["bollinger_position"] = calculate_bollinger_position(close)
+    kalman_velocity = []
+    kalman_error = []
 
-    #volatility: how risky the market is right now
-    df["volatility_20"] = df['log_returns'].rolling(window = 20).std()
+    for z in close:
+        x = kf.predict(x)
+        x, innovation, error_cov = kf.update(x, z)
 
-    vol = df['Volume'].replace(0, np.nan).ffill()
-    
-    #volume change: activity
-    df["volume_change"] = np.log(vol / vol.shift(1)).fillna(0)
+        # FEATURE LOBOTOMY: We throw away 'innovation' (noise)
+        kalman_velocity.append(x[1,0])
+        kalman_error.append(error_cov[0,0])
 
-    df["volume_change"] = df['volume_change'].replace([np.inf, -np.inf], 0)
+    df['log_ret'] = log_ret
+    df['k_vel'] = kalman_velocity
+    df['k_err'] = kalman_error
 
-    df.dropna(inplace = True)
+    # Normalize
+    df['k_vel_norm'] = (df['k_vel'] - df['k_vel'].rolling(50).mean()) / (df['k_vel'].rolling(50).std() + 1e-8)
+    df['vol_20'] = df['log_ret'].rolling(20).std()
 
-    design_columns = ['log_returns', 'rsi_norm', 'macd_diff', 'bollinger_position', 'volatility_20', 'volume_change']
+    df.dropna(inplace=True)
 
-    print(f"data engineered. matrix shape: {df[design_columns].shape}")
-    print(f"columns: {design_columns}")
+    # Final Feature Set: 4 Dimensions (Noise Removed)
+    design_columns = ['log_ret', 'k_vel_norm', 'k_err', 'vol_20']
+
+    print(f"✅ Berkeley Data Engineered. Matrix Shape: {df[design_columns].shape}")
+    print(f"   Features: {design_columns} (Noise Removed)")
 
     return df[design_columns].values
