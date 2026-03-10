@@ -1,4 +1,3 @@
-%%writefile README.md
 # Phase 1 Report: The Limits of Retail Technical Analysis
 
 ## 1. Objective
